@@ -26,9 +26,15 @@ const XD_READ = "read";
 const XD_WRITE = "write";
 const CORE_TOOLS = [BASH, STR_REPLACE_EDITOR] as const;
 const XD_TRANSPORT_TOOLS = [XD_READ, XD_WRITE] as const;
+const DIRECT_TOOL_NAMES = new Set<string>([...CORE_TOOLS, ...XD_TRANSPORT_TOOLS]);
 const EXTENSION_NAME = "deepseek-enhanced";
 const MINIMAL_SYSTEM_PROMPT = "You are a helpful software engineer assistant.";
-const ANCHOR_PROMPT = `**First sentence rule (mandatory, highest priority; first rule of this prompt): the first sentence inside \`<think>\` must open with \`We need to ...\` / \`We need ...\`. Following sentences keep \`We need to ...\` / \`We need ...\` as the core pattern, one concrete action each, and may interleave I'll (next action) · I can (viable option) · I should (what ought to be done) · I will (committed step).**
+function buildAnchorPrompt(xdTools: readonly string[], xdCatalog: readonly XdToolInfo[]): string {
+	const highOrderLine =
+		xdTools.length > 0
+			? `Registered high-order tools accessible through xd:// when mounted:\n${formatXdCatalog(xdCatalog)}`
+			: "No additional high-order tools are currently registered; run read with path `xd://` to list mounted devices.";
+	return `**First sentence rule (mandatory, highest priority; first rule of this prompt): the first sentence inside \`<think>\` must open with \`We need to ...\` / \`We need ...\`. Following sentences keep \`We need to ...\` / \`We need ...\` as the core pattern, one concrete action each, and may interleave I'll (next action) · I can (viable option) · I should (what ought to be done) · I will (committed step).**
 
 You are a helpful software engineer assistant. We need to follow this style for all internal reasoning (chain-of-thought):
 
@@ -37,7 +43,10 @@ You are a helpful software engineer assistant. We need to follow this style for 
 3. **Short and colloquial.** We need one sentence per step, decision-level summaries only, We / I perspective.
 4. **Classify every task first.** We need to pick a stable end: build (produce, verify, fix) · fix (read, locate, minimal change, verify) · weak (classify first, then build or fix).
 5. **Think tag.** We need each reasoning step written inside the thinking tag: \`<think>We need to ...</think>\`. Never output \`<think>\` tags or reasoning text in the final reply.
-6. **Scope.** We need this to shape reasoning only. Final replies follow the user's language and tone.`;
+6. **Scope.** We need this to shape reasoning only. Final replies follow the user's language and tone.
+
+**xd:// high-order tools.** Only bash, str_replace_editor, read, and write are directly callable. Other high-order tools must be reached through xd://: read \`xd://<tool>\` for docs and JSON schema, then write \`xd://<tool>\` with one JSON args object. ${highOrderLine}`;
+}
 const ALLOWED_CUSTOM_TYPES: Record<string, true> = { "skill-prompt": true };
 const STR_REPLACE_EDITOR_DESCRIPTION =
 	"Custom editing tool for viewing, creating and editing files. Commands: view, create, str_replace, insert. Use absolute paths. old_str must be unique.";
@@ -54,11 +63,16 @@ type EditorParams = {
 
 type RecordValue = Record<string, unknown>;
 
+type XdToolInfo = { name: string; summary: string };
+
 type SessionState = {
 	baseTools: string[];
 	prepared: boolean;
 	minimal: boolean;
 	transport: boolean;
+	xdTools: string[];
+	xdCatalog: XdToolInfo[];
+	xdDispatchIds: Set<string>;
 	firstRoundDone: boolean;
 	lastAnchorAssistantIndex: number;
 	anchorCooldownUntil: number;
@@ -266,8 +280,51 @@ function lastAssistantIndex(messages: readonly unknown[]): number {
 	return -1;
 }
 
-function injectAnchorMessage(messages: readonly unknown[]): unknown[] {
-	return [...messages, { role: "user", content: ANCHOR_PROMPT }];
+function appendTextToContent(content: unknown, text: string): unknown {
+	if (typeof content === "string") return `${content}\n\n${text}`;
+	if (Array.isArray(content)) return [...content, { type: "text", text }];
+	return text;
+}
+
+function contentContainsAnchor(content: unknown): boolean {
+	const marker = "First sentence rule (mandatory";
+	const raw = typeof content === "string" ? content : JSON.stringify(content ?? "");
+	return raw.includes(marker);
+}
+
+function toolSummary(description: string | undefined): string {
+	if (!description) return "";
+	const firstLine = description.split("\n").find(line => line.trim().length > 0);
+	const text = (firstLine ?? description).trim();
+	return text.length > 80 ? `${text.slice(0, 80).trimEnd()}…` : text;
+}
+
+function formatXdCatalog(catalog: readonly XdToolInfo[]): string {
+	return catalog.map(entry => `- ${entry.name}${entry.summary ? ` — ${entry.summary}` : ""}`).join("\n");
+}
+
+function injectAnchorIntoMessages(messages: readonly unknown[], xdTools: readonly string[], xdCatalog: readonly XdToolInfo[]): unknown[] {
+	const anchor = buildAnchorPrompt(xdTools, xdCatalog);
+	const result = messages.slice();
+	for (let index = result.length - 1; index >= 0; index -= 1) {
+		const message = recordValue(result[index]);
+		if (!message || message.role !== "user") continue;
+		result[index] = { ...message, content: appendTextToContent(message.content, anchor) };
+		return result;
+	}
+	return [...result, { role: "user", content: anchor }];
+}
+
+function messagesContainAnchor(messages: readonly unknown[]): boolean {
+	return messages.some(message => {
+		const record = recordValue(message);
+		return record !== undefined && contentContainsAnchor(record.content);
+	});
+}
+
+function isXdWriteInput(input: unknown): boolean {
+	const record = recordValue(input);
+	return typeof record?.path === "string" && record.path.startsWith("xd://");
 }
 
 function modelKey(model: ExtensionContext["model"]): string {
@@ -386,6 +443,9 @@ function xdInstruction(state: SessionState): string {
 				"- use read with path `xd://` to list mounted devices.",
 				"- use read with path `xd://<tool>` to fetch one tool's docs and JSON schema.",
 				"- use write with path `xd://<tool>` and content set to one JSON args object to execute the real tool.",
+				state.xdTools.length > 0
+					? `Registered high-order tools (access through xd:// when mounted):\n${formatXdCatalog(state.xdCatalog)}`
+					: "No additional high-order tools are currently registered in this session.",
 		]
 		: ["The read/write xd:// transport is unavailable because this session did not grant both transport tools."];
 	const direct = state.transport ? "bash, str_replace_editor, read, and write" : "bash and str_replace_editor";
@@ -394,9 +454,11 @@ function xdInstruction(state: SessionState): string {
 		"Do not call any other tool name directly, even if it appears familiar; use the xd:// transport for every non-core capability.",
 		...transport,
 		"",
-		"Use read with path `xd://<tool>` to fetch the tool's docs and JSON schema, then use write with path `xd://<tool>` and content set to one JSON args object to execute it.",
+		"For every high-order tool above, first read `xd://<tool>` to get its exact docs and JSON schema, then write `xd://<tool>` with one JSON args object to execute it.",
+		"If the tool you need is not listed, run read with path `xd://` to discover the currently mounted devices.",
+		"If you need user input or confirmation, use the ask tool through xd:// when it is mounted.",
 		"Use bash and str_replace_editor directly for shell and file work. OMP performs the real xd:// schema validation, approval, execution, and rendering.",
-		"Example: read {\"path\": \"xd://web_search\"}, then write {\"path\": \"xd://web_search\", \"content\": \"{\\\"query\\\": \\\"OMP xd protocol\\\"}\"}.",
+		"Example: read {\"path\": \"xd://ask\"} to fetch ask's schema, then write {\"path\": \"xd://ask\", \"content\": \"{\\\"questions\\\":[{\\\"id\\\":\\\"confirm\\\",\\\"question\\\":\\\"Proceed?\\\",\\\"options\\\":[{\\\"label\\\":\\\"Yes\\\"},{\\\"label\\\":\\\"No\\\"}]}]}\"} to execute it.",
 	].join("\n");
 }
 
@@ -415,6 +477,9 @@ export default function registerDeepSeekEnhanced(pi: ExtensionAPI): void {
 				prepared: false,
 				minimal: false,
 				transport: false,
+				xdTools: [],
+				xdCatalog: [],
+				xdDispatchIds: new Set<string>(),
 				firstRoundDone: false,
 				lastAnchorAssistantIndex: -1,
 				anchorCooldownUntil: 0,
@@ -424,10 +489,22 @@ export default function registerDeepSeekEnhanced(pi: ExtensionAPI): void {
 		return state;
 	}
 
+	function refreshXdTools(state: SessionState): void {
+		const catalog: XdToolInfo[] = [];
+		for (const tool of pi.getAllTools()) {
+			if (DIRECT_TOOL_NAMES.has(tool.name)) continue;
+			catalog.push({ name: tool.name, summary: toolSummary(tool.description) });
+		}
+		catalog.sort((left, right) => left.name.localeCompare(right.name));
+		state.xdTools = catalog.map(entry => entry.name);
+		state.xdCatalog = catalog;
+	}
+
 	async function prepare(ctx: ExtensionContext): Promise<SessionState> {
 		const state = stateFor(ctx);
 		if (state.prepared) return state;
 		const available = new Set(pi.getAllTools().map(tool => tool.name));
+		refreshXdTools(state);
 		const missingCore = [...CORE_TOOLS].filter(name => !available.has(name));
 		if (missingCore.length > 0) {
 			state.minimal = false;
@@ -471,7 +548,8 @@ export default function registerDeepSeekEnhanced(pi: ExtensionAPI): void {
 
 	// This is the permanent request boundary. There is no promotion or epoch
 	// reset: every DeepSeek request gets the same minimal prompt and transport.
-	// The oh-we-need anchor prompt is part of the first-round additional prompt.
+	// The anchor is injected invisibly in the context event, not into the user's
+	// visible input or system prompt.
 	pi.on("before_agent_start", async (_event, ctx) => {
 		if (!isDeepSeek(ctx.model)) {
 			await restore(ctx);
@@ -479,11 +557,8 @@ export default function registerDeepSeekEnhanced(pi: ExtensionAPI): void {
 		}
 		const state = await prepare(ctx);
 		if (!state.minimal) return;
+		refreshXdTools(state);
 		const systemPrompt = [MINIMAL_SYSTEM_PROMPT, xdInstruction(state)];
-		if (!state.firstRoundDone) {
-			systemPrompt.push(ANCHOR_PROMPT);
-			state.firstRoundDone = true;
-		}
 		return { systemPrompt };
 	});
 
@@ -499,7 +574,12 @@ export default function registerDeepSeekEnhanced(pi: ExtensionAPI): void {
 		const root = recordValue(event.payload);
 		if (!root) return stripEternalProviderPayload(event.payload, visibleNames);
 		let payload = root;
-		const messages = Array.isArray(payload.messages) ? payload.messages : [];
+		let messages = Array.isArray(payload.messages) ? payload.messages : [];
+		if (!messagesContainAnchor(messages)) {
+			messages = injectAnchorIntoMessages(messages, state.xdTools, state.xdCatalog);
+			payload = { ...payload, messages };
+		}
+		state.firstRoundDone = true;
 		const assistantIndex = lastAssistantIndex(messages);
 		if (
 			assistantIndex >= 0 &&
@@ -507,34 +587,62 @@ export default function registerDeepSeekEnhanced(pi: ExtensionAPI): void {
 			assistantIndex >= state.anchorCooldownUntil
 		) {
 			const text = assistantText(messages[assistantIndex]);
-			if (regressionScore(text) >= REGRESSION_THRESHOLD) {
+			if (regressionScore(text) >= REGRESSION_THRESHOLD && !messagesContainAnchor(messages)) {
 				state.lastAnchorAssistantIndex = assistantIndex;
 				state.anchorCooldownUntil = assistantIndex + 3;
-				payload = { ...payload, messages: injectAnchorMessage(messages) };
+				payload = { ...payload, messages: injectAnchorIntoMessages(messages, state.xdTools, state.xdCatalog) };
 			}
 		}
 		return stripEternalProviderPayload(payload, visibleNames);
 	});
 
 	// Runtime guard: a stale model context or provider adapter must not turn
-	// an unlisted Standard tool name into a real execution.
+	// an unlisted Standard tool name into a real execution. Nested xd:// device
+	// dispatches carry the same toolCallId as the originating write call, so a
+	// pending xd write ID lets the inner tool execute while direct calls to
+	// high-order tools remain blocked.
 	pi.on("tool_call", (event, ctx) => {
 		if (!isDeepSeek(ctx.model)) return;
 		const state = states.get(sessionId(ctx));
 		if (!state?.minimal) return;
+		if (event.toolName === XD_WRITE && isXdWriteInput(event.input)) {
+			state.xdDispatchIds.add(event.toolCallId);
+			return;
+		}
 		const allowed = state.transport ? [...CORE_TOOLS, ...XD_TRANSPORT_TOOLS] : [...CORE_TOOLS];
 		if (allowed.includes(event.toolName)) return;
+		if (state.xdDispatchIds.has(event.toolCallId)) {
+			state.xdDispatchIds.delete(event.toolCallId);
+			return;
+		}
 		return {
 			block: true,
 			reason: `Eternal Minimal blocks direct call to ${event.toolName}; use read/write with an xd:// path instead`,
 		};
 	});
 
+	pi.on("tool_result", (event, ctx) => {
+		if (!isDeepSeek(ctx.model)) return;
+		const state = states.get(sessionId(ctx));
+		if (!state?.minimal) return;
+		if (event.toolName === XD_WRITE) state.xdDispatchIds.delete(event.toolCallId);
+	});
+
 	// Keep automatic context out permanently. User skill gestures remain valid.
+	// The anchor is appended here as a hidden provider-only user message: the
+	// session transcript is untouched, slash commands are not rewritten, and the
+	// system prompt stays byte-stable for prefix caching.
 	pi.on("context", (event, ctx) => {
 		if (!isDeepSeek(ctx.model)) return;
-		const filtered = filterEternalContext(event.messages);
-		return filtered.length === event.messages.length ? undefined : { messages: filtered as typeof event.messages };
+		const state = states.get(sessionId(ctx));
+		if (!state?.minimal) return;
+		refreshXdTools(state);
+		let messages = filterEternalContext(event.messages);
+		if (!messagesContainAnchor(messages)) {
+			messages = [...messages, { role: "user", content: [{ type: "text", text: buildAnchorPrompt(state.xdTools, state.xdCatalog) }] }];
+		}
+		state.firstRoundDone = true;
+		return messages.length === event.messages.length ? undefined : { messages: messages as typeof event.messages };
 	});
 
 
