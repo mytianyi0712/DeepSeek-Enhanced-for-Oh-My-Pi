@@ -67,3 +67,8 @@ extensions:
 ## License
 
 MIT
+
+## 致谢
+
+- [dsh-anchored-standard](https://github.com/xiaobright/dsh-anchored-standard)：本项目参考该项目的 Eternal Minimal 思路设计。
+- [oh-we-need](https://github.com/scp3500/oh-we-need)：本项目使用该项目编写的约束性提示词，强化 We need 思维链触发以及锚定。
