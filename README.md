@@ -1,7 +1,10 @@
 # DeepSeek Enhanced for Oh My Pi
 
 DeepSeek 增强扩展：在 Oh My Pi 中把 DeepSeek 会话切换到 **Eternal Minimal** 工具面，并通过 **we need** 锚定提示词稳定模型思维链。
+
 经过不谨慎测试，已经可以确认思维链可以准确锚定为We need风格，模型性能是否提升，提升多大还需要进一步详细测试，感兴趣的可以自行测试，从本人使用体验来看似乎可以达到DSH极简模式的水平。
+
+补充本人使用体验，该插件目前对deepseek v4 flash增幅效果不明显，几乎未体验出任何区别，但对pro似乎有不错的改善，欢迎反馈使用体验
 
 ## 特性
 
